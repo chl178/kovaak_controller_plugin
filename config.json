@@ -1,0 +1,21 @@
+{
+	"loop_hz": 16000,
+	"settings_path": "",
+	"deg_per_count_override": 0.0,
+	"always_inject": false,
+	"invert_y": false,
+	"no_move": false,
+	"move_threshold": 0.4,
+	"target_processes": ["fpsaimtrainer-win64-shipping.exe", "fpsaimtrainer.exe"],
+	"apex": {
+		"look_curve": 2,
+		"hip_aim_speed": 4,
+		"ads_aim_speed": 3,
+		"ads_scalar": 1.0,
+		"deadzone_in": 0.0,
+		"deadzone_out": 0.0,
+		"speed_scale": 1.0,
+		"pitch_ratio": 0.8
+	},
+	"buttons": {}
+}

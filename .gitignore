@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+*.exe
+*.obj
+*.o
+*.d
+
+# Editor/OS
+.vscode/
+.idea/
+Thumbs.db
