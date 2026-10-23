@@ -1,134 +1,156 @@
-# kovaak_controller — KovaaK's 原生手柄桥
+# kovaak_controller — Native controller bridge for KovaaK's
 
-**[English](README_EN.md)** | 中文
+**English** | [中文](README.zh-CN.md)
 
-让你用**手柄原生输入**玩 KovaaK's FPS Aim Trainer：摇杆直接驱动视角，
-转速、死区、响应曲线与延迟全部可配置、可推导，默认参数复刻
-Apex Legends 主机版手柄的视角手感。
+Play KovaaK's FPS Aim Trainer with **native controller input**: the right stick
+drives the camera directly, with fully configurable and derivable turn speed,
+deadzones, response curves and latency. Defaults replicate the console
+controller camera feel of Apex Legends.
 
-## 原理（与 Steam Input/JoyToKey 类"摇杆转鼠标"方案的本质区别）
+## How it works (and why it differs from Steam Input / JoyToKey-style "stick-to-mouse")
 
 ```
-手柄 HID (16-bit 轴, 0 死区, 设备报告率最高 8kHz)
-   │  RawInput RIDEV_INPUTSINK（后台接收，绕过 XInput，双精度直读）
+Controller HID (16-bit axes, 0 deadzone, up to 8kHz device polling)
+   │  RawInput RIDEV_INPUTSINK (background capture, bypasses XInput,
+   ▼  double-precision direct reads)
+Camera control model (fully implemented in this project, all parameters configurable)
+   │  Response curve | Hip aim level 4 = 255°/s | ADS aim level 3 = 191.25°/s
+   │  Deadzone 0%/0% | Pitch = yaw × 0.8 | Hard cap 510°/s (85 RPM)
    ▼
-视角控制模型（本项目完整实现，参数全部可配置）
-   │  响应曲线 | 腰射转速档 4 = 255°/s | 开镜转速档 3 = 191.25°/s
-   │  死区 0%/0% | 俯仰 = 偏航×0.8 | 硬上限 510°/s (85 RPM)
+°/s ÷ KovaaK's deg/count (auto-derived from PrimaryUserSettings.json)
+   │  e.g. CS scale XSens 1.8 → 0.0396°/count → full deflection = 6439 counts/s
    ▼
-°/s ÷ KovaaK's deg/count（自动读 PrimaryUserSettings.json 推导）
-   │  例：CS 刻度 XSens 1.8 → 0.0396°/count → 满杆 = 6439 counts/s
-   ▼
-SendInput 相对鼠标计数（16000Hz QPC 循环）→ KovaaK's (UE4 Raw Input)
+SendInput relative mouse counts (16000Hz QPC loop) → KovaaK's (UE4 Raw Input)
 ```
 
-- **输入侧 100% 原生**：直接解析手柄 HID 报告，16-bit 摇杆分辨率
-  （1 计数 = 1/32768 摆幅），无 XInput 死区/量化，无 Steam Input 转换层，
-  无摇杆→光标语义。
-- **视角模型完整自实现**：5 档响应曲线、腰射/开镜独立转速、径向死区、
-  俯仰比、转速硬上限，全部参数开放配置（见下节），并由 `--selftest`
-  的 33 项断言逐一验证。
-- **延迟同级**：默认 16000Hz 注入循环（摇杆状态以 62.5µs 粒度重采样），
-  按键在 HID 报告到达的瞬间（读取线程内）即注入。
-- 输出通道说明：KovaaK's 没有插件 API 也不读手柄，相对鼠标计数是它唯一的
-  外部输入通道——这也是真实鼠标的同一通道，逐计数等价，不是"光标移动转换"。
+- **100% native input**: gamepad HID reports are parsed directly — 16-bit stick
+  resolution (1 count = 1/32768 of deflection), no XInput deadzone/quantization,
+  no Steam Input conversion layer, no stick→cursor semantics.
+- **Self-contained camera model**: 5 response curves, independent hip/ADS turn
+  speeds, radial deadzones, pitch ratio and a hard speed cap — all parameters
+  are configurable (see next section) and verified by the 33 assertions in
+  `--selftest`.
+- **Comparable latency**: default 16000Hz injection loop (stick state is
+  resampled at 62.5µs granularity); buttons are injected the moment their HID
+  report arrives (inside the reader thread).
+- Output channel note: KovaaK's has no plugin API and does not read gamepads;
+  relative mouse counts are its only external input channel — the very same
+  channel a real mouse uses, count-for-count equivalent, not a "cursor
+  movement" conversion.
 
-## 视角控制模型
+## Camera control model
 
-摇杆偏转 → 视角角速度的完整数学（`src/apex_sens.h`）：
+The complete stick-deflection → angular-velocity math (`src/apex_sens.h`):
 
-1. **幅度**：取摇杆向量圆形幅度 `√(rx² + ry²)`，钳到 1；
-2. **死区**：径向重映射 `(m − dz_in) / (1 − dz_in − dz_out)`（默认 0/0 直通）；
-3. **响应曲线**（全部过 (0,0) 与 (1,1)，满杆输出满速）：
+1. **Magnitude**: circular stick magnitude `√(rx² + ry²)`, clamped to 1;
+2. **Deadzone**: radial remap `(m − dz_in) / (1 − dz_in − dz_out)`
+   (defaults 0/0 → pass-through);
+3. **Response curve** (all pass through (0,0) and (1,1); full deflection =
+   full speed):
 
-   | 曲线 | 公式 | 手感 |
+   | Curve | Formula | Feel |
    |---|---|---|
-   | Classic (0) | `3x² − 2x³`（Hermite 平滑） | 中段快、两端缓 |
-   | Steady (1) | `x^2.5` | 小输入更稳 |
-   | Linear (2) | `x`（恒等，默认） | 输入输出严格成正比 |
-   | Wide (3) | `x^1.4` | 中段更饱满 |
-   | Precise (4) | `x^1.8` | 小输入更细腻 |
+   | Classic (0) | `3x² − 2x³` (Hermite smoothstep) | fast middle, soft ends |
+   | Steady (1) | `x^2.5` | steadier at small inputs |
+   | Linear (2) | `x` (identity, default) | strictly proportional |
+   | Wide (3) | `x^1.4` | fuller middle range |
+   | Precise (4) | `x^1.8` | finer at small inputs |
 
-4. **转速**：`角速度 = 曲线输出 × 转速档 × 63.75°/s`，开镜再乘 `ads_scalar`，
-   全局硬上限 510°/s（85 RPM）。默认腰射档 4 = 255°/s、开镜档 3 = 191.25°/s；
-5. **方向**：按原始摇杆向量方向分配偏航/俯仰，俯仰恒为偏航的 80%
-   （`pitch_ratio` 可调）。
+4. **Speed**: `angular velocity = curve output × aim level × 63.75°/s`; ADS is
+   additionally scaled by `ads_scalar`, with a global hard cap of 510°/s
+   (85 RPM). Defaults: hip level 4 = 255°/s, ADS level 3 = 191.25°/s;
+5. **Direction**: yaw/pitch are distributed along the raw stick direction;
+   pitch is always 80% of yaw (adjustable via `pitch_ratio`).
 
-该模型即主机 FPS 通用的"视角速度"灵敏度定义：摇杆摆幅决定的是**°/s**，
-与游戏内鼠标灵敏度无关——换灵敏度后换算自动重算，手感不变。
+This is the standard console-FPS "camera speed" sensitivity definition: stick
+deflection determines **°/s**, independent of the in-game mouse sensitivity —
+when you change sensitivity, the conversion is recomputed automatically and the
+feel stays the same.
 
-## 使用
+## Usage
 
 ```powershell
-# 1. 先自检（无需手柄，校验数学与 KovaaK's 设置推导）
+# 1. Self-test first (no controller needed; validates the math and the
+#    KovaaK's settings derivation)
 .\build\kovaak_controller.exe --selftest
 
-# 2. （建议首测）dry-run：只计算不注入，摇杆偏转时看注入计数变化
+# 2. (Recommended first run) dry-run: compute but don't inject; watch the
+#    injection counts change as you deflect the stick
 .\build\kovaak_controller.exe --dry-run
 
-# 3. 正式使用：启动后打开 KovaaK's（前台=游戏时才注入，切出自动暂停）
+# 3. Normal use: start it, then open KovaaK's (injects only while the game
+#    is in the foreground; auto-pauses when you switch away)
 .\build\kovaak_controller.exe
 
-# 手柄按键映射不对时：诊断实机 HID usage ID
+# If button mapping is wrong: diagnose the device's real HID usage IDs
 .\build\kovaak_controller.exe --diag
 ```
 
-Ctrl+C 退出（自动释放全部注入按键）。CPU 不足时用 `--loop-hz 8000` 降自旋频率。
+Ctrl+C to quit (all injected keys are released automatically). Use
+`--loop-hz 8000` to reduce CPU spin if needed.
 
-## 按键映射（Button Puncher 布局）
+## Button mapping (Button Puncher layout)
 
-| 手柄 | 注入 | 说明 |
+| Controller | Injects | Notes |
 |---|---|---|
-| RB / R1 | 鼠标左键 | 开火 |
-| LB / L1 | 鼠标右键 | 开镜（同时开镜转速档生效）|
-| A / 叉 | Space | 跳跃 |
-| X / 方块 | R | 换弹 |
-| Menu / Options | Esc | KovaaK's 菜单 |
-| LS / L3 按下 | Shift | 冲刺 |
-| 左摇杆 | WASD | 移动（阈值 0.4，可调 `move_threshold`）|
-| 右摇杆 | 视角 | 视角模型直出 |
+| RB / R1 | Left mouse | Fire |
+| LB / L1 | Right mouse | ADS (also switches to the ADS speed level) |
+| A / Cross | Space | Jump |
+| X / Square | R | Reload |
+| Menu / Options | Esc | KovaaK's menu |
+| LS / L3 press | Shift | Sprint |
+| Left stick | WASD | Movement (threshold 0.4, see `move_threshold`) |
+| Right stick | Camera | Direct camera-model output |
 
-按键默认按设备 VID 自动选择 Xbox/PlayStation 布局；不匹配时用 `--diag`
-看实机 usage ID，然后在 `config.json` 的 `buttons` 里覆盖：
+Layout (Xbox vs PlayStation) is auto-selected by device VID; if it doesn't
+match, run `--diag` to see the actual usage IDs and override them in
+`config.json`:
 
 ```json
 "buttons": { "fire": 6, "ads": 5, "jump": 1, "reload": 3, "escape": 8, "sprint": 9 }
 ```
 
-## 配置（config.json，与 exe 同目录）
+## Configuration (config.json, next to the exe)
 
-| 键 | 默认 | 说明 |
+| Key | Default | Description |
 |---|---|---|
-| `loop_hz` | 16000 | 注入循环频率（8000 可降 CPU）|
-| `settings_path` | 自动 | KovaaK's PrimaryUserSettings.json 路径（默认自动探测 C:/D: Steam 库）|
-| `deg_per_count_override` | 0 | >0 时固定换算，不读游戏设置 |
-| `always_inject` | false | 关闭前台闸门（默认仅 KovaaK's 前台时注入）|
-| `invert_y` | false | 俯仰反转（也会读取游戏内 YInvert）|
-| `move_threshold` | 0.4 | 左摇杆→WASD 触发阈值（带迟滞）|
-| `apex.*` | 见上表 | 视角模型参数：look_curve / hip_aim_speed / ads_aim_speed / ads_scalar / deadzone / pitch_ratio |
-| `target_processes` | KovaaK's | 前台闸门进程名列表 |
+| `loop_hz` | 16000 | Injection loop frequency (8000 saves CPU) |
+| `settings_path` | auto | KovaaK's PrimaryUserSettings.json path (auto-detects C:/D: Steam libraries) |
+| `deg_per_count_override` | 0 | When >0, fixes the conversion instead of reading game settings |
+| `always_inject` | false | Disable the foreground gate (by default injection only happens while KovaaK's is focused) |
+| `invert_y` | false | Invert pitch (the in-game YInvert is also honored) |
+| `move_threshold` | 0.4 | Left stick → WASD trigger threshold (with hysteresis) |
+| `apex.*` | see table above | Camera model params: look_curve / hip_aim_speed / ads_aim_speed / ads_scalar / deadzone / pitch_ratio |
+| `target_processes` | KovaaK's | Foreground gate process names |
 
-**设置热重载**：在 KovaaK's 里改灵敏度后，桥自动重读并重算换算
-（摇杆→屏幕转速始终恒定，不受游戏灵敏度影响）。
+**Settings hot-reload**: after you change sensitivity inside KovaaK's, the
+bridge re-reads and recomputes the conversion automatically (stick → on-screen
+turn speed stays constant regardless of game sensitivity).
 
-## 构建
+## Build
 
 ```powershell
 powershell -File build.ps1   # w64devkit MinGW g++ (GCC 14)
 ```
 
-源码：`src/rawinput_reader.*`（HID 报告解析与设备管理）、
-`src/apex_sens.h`（视角控制模型）、`src/kovaak_config.*`（设置推导+公式求值）、
-`src/injector.h`（SendInput）、`src/main.cpp`（16000Hz 主循环/闸门/映射/自检）。
+Sources: `src/rawinput_reader.*` (HID report parsing and device management),
+`src/apex_sens.h` (camera control model), `src/kovaak_config.*` (settings
+derivation + expression evaluation), `src/injector.h` (SendInput),
+`src/main.cpp` (16000Hz main loop / gate / mapping / self-test).
 
-## 注意事项
+## Notes
 
-1. **禁用 Steam Input**（重要）：Steam → FPSAimTrainer → 属性 → 控制器 →
-   "禁用 Steam Input"，否则 Steam 会抢先把手柄转换成鼠标/键盘造成双重输入。
-2. **权限一致**：若 KovaaK's 以管理员运行，本工具也要管理员运行（UIPI 会拦截低权限注入）。
-3. **ADS 缩放**：KovaaK's 武器开镜有自己的 FOV 缩放，屏幕上的转动观感会随 FOV 变化；
-   摇杆→°/s 的物理转速是恒定的（这是灵敏度的一致定义）。
-   想要与目标游戏相同的观感，把 KovaaK's FOV 调成一致（如 Apex 的 110 水平）。
-4. 0 死区意味着摇杆漂移会直通；如有漂移可在 `config.json`
-   设 `apex.deadzone_in`（如 0.02）。
-5. 已实测：本机手柄（VID_413D，8kHz 轮询）HID 直读 ~7990Hz、16-bit 位深。
+1. **Disable Steam Input** (important): Steam → FPSAimTrainer → Properties →
+   Controller → "Disable Steam Input", otherwise Steam intercepts the gamepad
+   first and converts it to mouse/keyboard, causing double input.
+2. **Matching privileges**: if KovaaK's runs as administrator, this tool must
+   too (UIPI blocks lower-privilege injection).
+3. **ADS scaling**: KovaaK's weapons apply their own FOV zoom when aiming, so
+   the on-screen turning feel varies with FOV; the physical stick → °/s speed
+   stays constant (that is the consistent definition of sensitivity). For
+   identical on-screen feel, set KovaaK's FOV to match the target game
+   (e.g. 110 horizontal for Apex).
+4. 0 deadzone means stick drift passes straight through; if your stick drifts,
+   set `apex.deadzone_in` in `config.json` (e.g. 0.02).
+5. Measured: with a local controller (VID_413D, 8kHz polling), HID reads run
+   at ~7990Hz with 16-bit resolution.
